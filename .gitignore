@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.python-embed/
+logs/
+data/*.db
+python-3.13.3-amd64.exe
+python-3.13.3-embed-amd64.zip
+patch.diff

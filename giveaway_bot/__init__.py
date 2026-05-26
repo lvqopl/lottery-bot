@@ -1,0 +1,1 @@
+﻿# Telegram giveaway bot package.
