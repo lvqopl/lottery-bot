@@ -1,5 +1,7 @@
-﻿import json
+import json
 import os
+import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,24 +25,32 @@ class TelegramClient:
     def request(self, method: str, params: Optional[Dict[str, Any]] = None, files: Optional[Dict[str, Tuple[str, bytes, str]]] = None) -> Dict[str, Any]:
         url = f'{self.api_base}/{method}'
         params = params or {}
-        try:
-            if files:
-                body, headers = self._encode_multipart(params, files)
-                req = urllib.request.Request(url, data=body, headers=headers)
-            else:
-                encoded = urllib.parse.urlencode({k: self._stringify(v) for k, v in params.items()}).encode('utf-8')
-                req = urllib.request.Request(url, data=encoded)
-            with self._opener.open(req, timeout=self.timeout) as resp:
-                payload = json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode('utf-8', errors='replace')
-            raise RuntimeError(f'Telegram API {method} failed: {exc.code} {body}') from exc
-        except Exception as exc:
-            raise RuntimeError(f'Telegram API {method} failed: {exc}') from exc
-        if not payload.get('ok'):
-            raise RuntimeError(f'Telegram API {method} returned error: {payload}')
-        return payload['result']
-
+        last_exc: Optional[BaseException] = None
+        for attempt in range(2):
+            try:
+                if files:
+                    body, headers = self._encode_multipart(params, files)
+                    req = urllib.request.Request(url, data=body, headers=headers)
+                else:
+                    encoded = urllib.parse.urlencode({k: self._stringify(v) for k, v in params.items()}).encode('utf-8')
+                    req = urllib.request.Request(url, data=encoded)
+                with self._opener.open(req, timeout=self.timeout) as resp:
+                    payload = json.loads(resp.read().decode('utf-8'))
+                if not payload.get('ok'):
+                    raise RuntimeError(f'Telegram API {method} returned error: {payload}')
+                return payload['result']
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode('utf-8', errors='replace')
+                raise RuntimeError(f'Telegram API {method} failed: {exc.code} {body}') from exc
+            except (urllib.error.URLError, ConnectionError, TimeoutError, ssl.SSLError, OSError) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
+                raise RuntimeError(f'Telegram API {method} failed: {exc}') from exc
+            except Exception as exc:
+                raise RuntimeError(f'Telegram API {method} failed: {exc}') from exc
+        raise RuntimeError(f'Telegram API {method} failed: {last_exc}')
     def _stringify(self, value: Any) -> str:
         if value is None:
             return ''

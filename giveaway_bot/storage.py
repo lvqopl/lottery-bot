@@ -154,6 +154,12 @@ class DB:
                     window_start TEXT NOT NULL,
                     hits INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 '''
             )
             self.conn.commit()
@@ -406,7 +412,7 @@ class DB:
         return self.all("SELECT * FROM giveaways WHERE claim_topic_enabled=1 AND claim_topic_deleted_at IS NULL AND claim_topic_expire_at IS NOT NULL AND claim_topic_expire_at<=?", (current,))
 
     def due_participant_targets(self) -> List[Dict[str, Any]]:
-        return self.all("SELECT * FROM giveaways WHERE status='live' AND auto_draw_mode='participants' AND draw_when_participants IS NOT NULL AND draw_when_participants>0")
+        return self.all("SELECT * FROM giveaways WHERE status='live' AND auto_draw_mode IN ('participants', 'both') AND draw_when_participants IS NOT NULL AND draw_when_participants>0")
 
     def add_participant(self, giveaway_id: int, user: Dict[str, Any], source: str, invited_by: Optional[int] = None) -> Tuple[bool, str, bool]:
         try:
@@ -453,4 +459,22 @@ class DB:
         self.exec('UPDATE participants SET claim_notified=1 WHERE giveaway_id=? AND telegram_user_id=?', (giveaway_id, telegram_user_id))
 
 
+
+
+
+    def set_bot_state(self, key: str, value: str) -> None:
+        self.exec(
+            '''
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            ''',
+            (key, value, now_s()),
+        )
+
+    def get_bot_state(self, key: str) -> Optional[str]:
+        row = self.one('SELECT value FROM bot_state WHERE key=?', (key,))
+        return str(row['value']) if row else None
 
