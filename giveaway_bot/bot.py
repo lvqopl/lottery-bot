@@ -801,6 +801,63 @@ class GiveawayBot:
             remaining -= 1
         return chosen
 
+    def process_due_giveaways(self) -> None:
+        current = now_s()
+        for row in self.db.due_to_start(current):
+            if row['status'] == 'scheduled':
+                self.db.update_giveaway(row['id'], status='live')
+                self.announce_giveaway(row['id'])
+        for row in self.db.all("SELECT * FROM giveaways WHERE status='live' AND announcement_sent=0 AND start_time<=?", (current,)):
+            self.announce_giveaway(row['id'])
+        for row in self.db.due_to_end(current):
+            self.finalize_giveaway(row['id'], manual=False)
+        for row in self.db.due_participant_targets():
+            self.maybe_auto_draw(row['id'])
+
+    def is_admin_of_chat(self, chat_ref: Any, user_id: int) -> bool:
+        try:
+            member = self.api.get_chat_member(chat_ref, user_id)
+            return member.get('status') in {'administrator', 'creator'}
+        except Exception as exc:
+            logging.warning('Admin check failed for chat %s user %s: %s', chat_ref, user_id, exc)
+            return False
+
+    def display_user(self, username: Optional[str], first_name: Optional[str], last_name: Optional[str], user_id: int) -> str:
+        name = ' '.join(part for part in [first_name, last_name] if part).strip()
+        if username:
+            return f'@{username}'
+        if name:
+            return f'{name} ({user_id})'
+        return str(user_id)
+
+    def display_user_html(self, username: Optional[str], first_name: Optional[str], last_name: Optional[str], user_id: int) -> str:
+        name = ' '.join(part for part in [first_name, last_name] if part).strip()
+        if username:
+            return f'@{esc(username)}'
+        if name:
+            return f'{esc(name)} (<code>{user_id}</code>)'
+        return f'<code>{user_id}</code>'
+
+    def build_weighted_pool(self, giveaway: Dict[str, Any], participants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [{'participant': participant, 'weight': max(1, int(self.get_entry_weight(giveaway, participant)))} for participant in participants]
+
+    def weighted_sample_without_replacement(self, pool: List[Dict[str, Any]], count: int, rng: random.Random) -> List[Dict[str, Any]]:
+        items = [dict(item) for item in pool]
+        chosen: List[Dict[str, Any]] = []
+        remaining = min(max(0, count), len(items))
+        while remaining > 0 and items:
+            total_weight = sum(max(1, int(item['weight'])) for item in items)
+            pick = rng.uniform(0, total_weight)
+            cumulative = 0.0
+            index = 0
+            for index, item in enumerate(items):
+                cumulative += max(1, int(item['weight']))
+                if cumulative >= pick:
+                    break
+            chosen.append(items.pop(index))
+            remaining -= 1
+        return chosen
 from .bot_tail import patch_giveaway_bot
 
 patch_giveaway_bot(GiveawayBot)
+
