@@ -857,6 +857,99 @@ class GiveawayBot:
             chosen.append(items.pop(index))
             remaining -= 1
         return chosen
+    def process_due_giveaways(self) -> None:
+        current = now_s()
+        for row in self.db.due_to_start(current):
+            if row['status'] == 'scheduled':
+                self.db.update_giveaway(row['id'], status='live')
+                self.announce_giveaway(row['id'])
+        for row in self.db.all("SELECT * FROM giveaways WHERE status='live' AND announcement_sent=0 AND start_time<=?", (current,)):
+            self.announce_giveaway(row['id'])
+        for row in self.db.due_to_end(current):
+            self.finalize_giveaway(row['id'], manual=False)
+        for row in self.db.due_participant_targets():
+            self.maybe_auto_draw(row['id'])
+
+    def maybe_auto_draw(self, giveaway_id: int) -> None:
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway or giveaway['status'] != 'live':
+            return
+        target = int(giveaway['draw_when_participants'] or 0)
+        if target <= 0:
+            return
+        current_count = self.db.count_participants(giveaway_id)
+        if current_count >= target:
+            self.finalize_giveaway(giveaway_id, manual=False)
+
+    def build_announcement_buttons(self, giveaway_id: int, giveaway: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
+        giveaway = giveaway or self.db.get_giveaway(giveaway_id)
+        if not giveaway:
+            return []
+        buttons = [[{'text': '参与抽奖', 'callback_data': f'join:{giveaway_id}'}], [{'text': '验证开奖结果', 'callback_data': f'verify:{giveaway_id}'}]]
+        if int(giveaway.get('invite_required_count') or 0) > 0 or int(giveaway.get('invite_weight_bonus') or 0) > 0:
+            buttons.append([{'text': '我的邀请链接', 'url': f'https://t.me/{self.bot_username}?start={sign_invite_payload(self.invite_secret, giveaway_id, int(giveaway["created_by"]))}'}])
+        return buttons
+
+    def build_announcement_text(self, giveaway: Dict[str, Any]) -> str:
+        methods = jload(giveaway['entry_methods'], [])
+        count = self.db.count_participants(giveaway['id'])
+        auto_draw = ''
+        if giveaway.get('draw_when_participants'):
+            auto_draw = f'\n📈 达到 {giveaway["draw_when_participants"]} 人自动开奖'
+        end_text = giveaway['end_time'] or '不限'
+        return (
+            '🎉 <b>抽奖活动开始啦！</b>\n\n'
+            f'🎁 奖品：{esc(giveaway["prize"])}\n'
+            f'🏆 中奖人数：{esc(giveaway["winner_count"])}\n'
+            f'📊 已参与人数：{count}\n'
+            f'⏰ 截止时间：{esc(end_text)}\n'
+            f'✅ 参与方式：{esc(method_text(methods, giveaway["entry_keyword"], giveaway["required_channel"], int(giveaway["invite_required_count"] or 0), int(giveaway["invite_weight_bonus"] or 0)))}'
+            f'{auto_draw}\n\n'
+            '点击下方按钮参与抽奖。'
+        )
+
+    def refresh_announcement_count(self, giveaway_id: int) -> None:
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway or not giveaway.get('announcement_sent') or not giveaway.get('announcement_message_id'):
+            return
+        try:
+            text = self.build_announcement_text(giveaway)
+            buttons = self.build_announcement_buttons(giveaway_id, giveaway)
+            self.api.edit_message_text(
+                giveaway['publish_chat_ref'],
+                int(giveaway['announcement_message_id']),
+                text,
+                reply_markup={'inline_keyboard': buttons},
+                message_thread_id=int(giveaway['publish_chat_thread_id']) if giveaway.get('publish_chat_thread_id') else None,
+            )
+        except Exception as exc:
+            logging.warning('Failed to refresh announcement count for giveaway %s: %s', giveaway_id, exc)
+
+    def announce_giveaway(self, giveaway_id: int) -> None:
+        cur = self.db.exec("UPDATE giveaways SET announcement_sent=2, updated_at=? WHERE id=? AND announcement_sent=0", (now_s(), giveaway_id))
+        if cur.rowcount != 1:
+            return
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway:
+            return
+        text = self.build_announcement_text(giveaway)
+        buttons = self.build_announcement_buttons(giveaway_id, giveaway)
+        try:
+            result = self.api.send_message(
+                giveaway['publish_chat_ref'],
+                text,
+                reply_markup={'inline_keyboard': buttons},
+                message_thread_id=int(giveaway['publish_chat_thread_id']) if giveaway.get('publish_chat_thread_id') else None,
+            )
+            try:
+                self.api.pin_chat_message(giveaway['publish_chat_ref'], int(result.get('message_id')))
+            except Exception as exc:
+                logging.warning('Failed to pin announcement for giveaway %s: %s', giveaway_id, exc)
+        except Exception:
+            self.db.update_giveaway(giveaway_id, announcement_sent=0)
+            raise
+        self.db.update_giveaway(giveaway_id, announcement_sent=1, announcement_message_id=result.get('message_id'))
+        self.db.log('giveaway_announced', giveaway['created_by'], giveaway_id, {'message_id': result.get('message_id')})
 from .bot_tail import patch_giveaway_bot
 
 patch_giveaway_bot(GiveawayBot)
