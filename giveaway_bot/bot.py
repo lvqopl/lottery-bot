@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import datetime as dt
@@ -764,6 +764,87 @@ class GiveawayBot:
             pass
             pass
 
+
+    def display_user(self, username: Optional[str], first_name: Optional[str], last_name: Optional[str], user_id: int) -> str:
+        name = ' '.join(part for part in [first_name, last_name] if part).strip()
+        if username:
+            return f'@{username}'
+        if name:
+            return f'{name} ({user_id})'
+        return str(user_id)
+
+    def display_user_html(self, username: Optional[str], first_name: Optional[str], last_name: Optional[str], user_id: int) -> str:
+        name = ' '.join(part for part in [first_name, last_name] if part).strip()
+        if username:
+            return f'@{esc(username)}'
+        if name:
+            return f'{esc(name)} (<code>{user_id}</code>)'
+        return f'<code>{user_id}</code>'
+
+    def build_weighted_pool(self, giveaway: Dict[str, Any], participants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [{'participant': participant, 'weight': max(1, int(self.get_entry_weight(giveaway, participant)))} for participant in participants]
+
+    def weighted_sample_without_replacement(self, pool: List[Dict[str, Any]], count: int, rng: random.Random) -> List[Dict[str, Any]]:
+        items = [dict(item) for item in pool]
+        chosen: List[Dict[str, Any]] = []
+        remaining = min(max(0, count), len(items))
+        while remaining > 0 and items:
+            total_weight = sum(max(1, int(item['weight'])) for item in items)
+            pick = rng.uniform(0, total_weight)
+            cumulative = 0.0
+            index = 0
+            for index, item in enumerate(items):
+                cumulative += max(1, int(item['weight']))
+                if cumulative >= pick:
+                    break
+            chosen.append(items.pop(index))
+            remaining -= 1
+        return chosen
+
+    def create_claim_topic(self, giveaway_id: int) -> None:
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway or not giveaway.get('claim_group_ref'):
+            return
+        if giveaway.get('claim_topic_thread_id'):
+            return
+        topic_name = giveaway.get('claim_topic_name') or f'???? #{giveaway_id}'
+        try:
+            topic = self.api.create_forum_topic(giveaway['claim_group_ref'], topic_name)
+            thread_id = int(topic.get('message_thread_id'))
+            expire_at = giveaway.get('claim_deadline')
+            invite_link = None
+            if expire_at:
+                try:
+                    expire_dt = dt.datetime.fromisoformat(expire_at)
+                    invite = self.api.create_chat_invite_link(
+                        giveaway['claim_group_ref'],
+                        name=f'claim-{giveaway_id}',
+                        expire_date=int(expire_dt.timestamp()),
+                    )
+                    invite_link = invite.get('invite_link')
+                except Exception as exc:
+                    logging.warning('Failed to create claim invite link for giveaway %s: %s', giveaway_id, exc)
+            self.db.update_giveaway(
+                giveaway_id,
+                claim_topic_thread_id=thread_id,
+                claim_topic_invite_link=invite_link,
+                claim_topic_expire_at=expire_at,
+            )
+        except Exception as exc:
+            logging.warning('Failed to create claim topic for giveaway %s: %s', giveaway_id, exc)
+
+    def process_due_claim_topics(self) -> None:
+        current = now_s()
+        for row in self.db.get_due_claim_topics(current):
+            thread_id = row.get('claim_topic_thread_id')
+            if not thread_id or row.get('claim_topic_deleted_at'):
+                continue
+            try:
+                self.api.delete_forum_topic(row['claim_group_ref'], int(thread_id))
+            except Exception as exc:
+                logging.warning('Failed to delete claim topic for giveaway %s: %s', row['id'], exc)
+            self.db.update_giveaway(row['id'], claim_topic_deleted_at=current)
+
     def send_temporary_message(self, chat_id: Any, text: str, delay: int = 10) -> None:
         try:
             result = self.api.send_message(chat_id, text)
@@ -962,16 +1043,18 @@ class GiveawayBot:
         self.db.update_giveaway(giveaway_id, announcement_sent=1, announcement_message_id=result.get('message_id'))
         self.db.log('giveaway_announced', giveaway['created_by'], giveaway_id, {'message_id': result.get('message_id')})
 
+
+"""
     def build_result_announcement_text(self, giveaway: Dict[str, Any], winner_lines: List[str], claim_deadline: str, finished_at: str, result_hash: str, valid_count: int) -> str:
         prize_text = format_prize_items(jload(giveaway.get('prize_json'), [])) or giveaway.get('prize') or '??'
         lines = [
-            '?? <b>??????</b>',
+            '?? ???????',
             '',
             f'???{esc(giveaway["title"])}',
             f'???{esc(prize_text)}',
             f'?????{esc(giveaway["winner_count"])}',
-            f'?????{valid_count}',
-            f'???????{esc(finished_at)}',
+            f'???????{valid_count}',
+            f'?????{esc(finished_at)}',
             f'?????<code>{esc(result_hash)}</code>',
             '',
             '?????',
@@ -979,13 +1062,14 @@ class GiveawayBot:
         if winner_lines:
             lines.extend(f'? {esc(line)}' for line in winner_lines)
         else:
-            lines.append('? ???????')
+            lines.append('? ?????')
         lines.extend([
             '',
-            f'?????{esc(claim_deadline)}',
-            '?????????????????',
+            f'?? {esc(claim_deadline)} ?????????',
+            '??????????????????????????????',
         ])
         return '\n'.join(lines)
+'.join(lines)
 
     def finalize_giveaway(self, giveaway_id: int, manual: bool = False) -> bool:
         with self.finalize_lock:
@@ -1021,16 +1105,24 @@ class GiveawayBot:
             seed_value = int(hashlib.sha256(seed_material.encode('utf-8')).hexdigest(), 16)
             rng = random.Random(seed_value)
             winners = self.weighted_sample_without_replacement(weighted_pool, winner_count, rng) if winner_count > 0 else []
-            winner_lines = []
-            winner_payload = []
+            winner_lines: List[str] = []
+            winner_payload: List[Dict[str, Any]] = []
             finished_at = now_s()
             for winner in winners:
-                display_name = self.display_user(winner['username'], winner['first_name'], winner['last_name'], winner['telegram_user_id'])
-                winner_weight = int(self.get_entry_weight(giveaway, winner))
-                winner_payload.append({'telegram_user_id': winner['telegram_user_id'], 'username': winner['username'], 'display_name': display_name, 'weight': winner_weight, 'winner_time': finished_at})
+                participant = winner['participant']
+                telegram_user_id = int(participant['telegram_user_id'])
+                display_name = self.display_user(participant.get('username'), participant.get('first_name'), participant.get('last_name'), telegram_user_id)
+                winner_weight = int(winner['weight'])
+                winner_payload.append({
+                    'telegram_user_id': telegram_user_id,
+                    'username': participant.get('username'),
+                    'display_name': display_name,
+                    'weight': winner_weight,
+                    'winner_time': finished_at,
+                })
                 winner_lines.append(f'{display_name} | ?? {winner_weight} | ???? {finished_at}')
             if not winner_lines:
-                winner_lines = ['???????']
+                winner_lines = ['?????']
             claim_hours = int(giveaway.get('claim_topic_hours') or 72)
             claim_deadline = (dt.datetime.fromisoformat(finished_at) + dt.timedelta(hours=claim_hours)).isoformat(sep=' ')
             result_payload = {
@@ -1091,78 +1183,83 @@ class GiveawayBot:
             telegram_user_id = int(item['telegram_user_id'])
             participant = participant_map.get(telegram_user_id)
             username = item.get('username') or (participant.get('username') if participant else None)
-            display = item.get('display_name') or self.display_user(username, participant.get('first_name') if participant else None, participant.get('last_name') if participant else None, telegram_user_id)
-            text = [
-                f'🎉 恭喜你在抽奖「{giveaway["title"]}」中中奖。',
-                f'中奖信息：{display}',
+            lines = [
+                f'?? ???????{giveaway["title"]}?????',
+                f'?????{display}',
             ]
             if claim_link:
-                text.append(f'请在 {expire_at} 前通过下面链接进入领奖话题:\n{claim_link}')
+                lines.append(f'?? {expire_at} ?????????????:\n{claim_link}')
             else:
-                text.append(f'请在 {expire_at} 前联系管理员领奖。')
+                lines.append(f'?? {expire_at} ?????????')
             try:
-                self.api.send_message(telegram_user_id, '\n'.join(text))
+                self.api.send_message(telegram_user_id, '\n'.join(lines))
+                self.api.send_message(telegram_user_id, '
+'.join(lines))
                 self.db.set_participant_claim_notified(giveaway_id, telegram_user_id)
             except Exception as exc:
                 logging.warning('Failed to notify winner %s: %s', telegram_user_id, exc)
 
-        if 'methods' in flags or 'method' in flags or 'entry' in flags:
-            updates['entry_methods'] = parse_methods(self.flag_value(flags, 'methods', 'method', 'entry'))
-        if 'keyword' in flags:
-            updates['entry_keyword'] = flags['keyword'] or None
-        if 'check_channel' in flags or 'channel' in flags:
-            updates['require_channel'] = 1 if self.flag_value(flags, 'check_channel', 'channel') else 0
-            updates['required_channel'] = self.flag_value(flags, 'check_channel', 'channel') or None
-        if 'invite_need' in flags or 'invite_count' in flags:
-            updates['invite_required_count'] = parse_optional_int(self.flag_value(flags, 'invite_need', 'invite_count'), '邀请人数', default=0, minimum=0)
-        if 'invite_bonus' in flags or 'invite_weight_bonus' in flags:
-            updates['invite_weight_bonus'] = parse_optional_int(self.flag_value(flags, 'invite_bonus', 'invite_weight_bonus'), '邀请加权', default=0, minimum=0)
-        if 'publish' in flags or 'publish_chat' in flags or 'chat' in flags:
-            updates['publish_chat_ref'] = self.flag_value(flags, 'publish', 'publish_chat', 'chat') or giveaway['publish_chat_ref']
-        if 'thread' in flags or 'publish_thread' in flags:
-            thread_text = self.flag_value(flags, 'thread', 'publish_thread')
-            updates['publish_chat_thread_id'] = int(thread_text) if thread_text else None
-        if 'draw_n' in flags or 'draw_when' in flags or 'participants' in flags:
-            draw_when = self.flag_value(flags, 'draw_n', 'draw_when', 'participants')
-            updates['draw_when_participants'] = parse_optional_int(draw_when, '指定人数开奖人数', default=0, minimum=0) if draw_when else None
-        if 'claim_group' in flags or 'claim_topic' in flags or 'claim_hours' in flags or 'claim_topic_hours' in flags:
-            if 'claim_group' in flags:
-                updates['claim_group_ref'] = flags['claim_group'] or None
-            if 'claim_topic' in flags:
-                updates['claim_topic_name'] = flags['claim_topic'] or None
-            if 'claim_hours' in flags or 'claim_topic_hours' in flags:
-                updates['claim_topic_hours'] = parse_optional_int(self.flag_value(flags, 'claim_hours', 'claim_topic_hours'), '领奖话题有效小时数', default=72, minimum=1)
-            if 'claim_group' in flags or 'claim_topic' in flags or 'claim_hours' in flags or 'claim_topic_hours' in flags:
-                updates['claim_topic_enabled'] = 1 if (updates.get('claim_group_ref') or giveaway.get('claim_group_ref')) else 0
-        if 'weight' in flags:
-            self.db.clear_giveaway_weights(giveaway_id)
-            special_weights = parse_weight_map(flags['weight'], self.resolve_username_to_user_id)
-            for uid, weight in special_weights.items():
-                self.db.set_giveaway_weight(giveaway_id, uid, weight, reason='special_weight')
-        if not updates:
-            self.api.send_message(chat['id'], self.giveaway_summary(giveaway_id))
+    def create_claim_topic(self, giveaway_id: int) -> None:
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway or not giveaway.get('claim_group_ref'):
             return
-        self.db.update_giveaway(giveaway_id, **updates)
-        self.db.log('giveaway_edited', user['id'], giveaway_id, updates)
-        self.api.send_message(chat['id'], f'✅ 抽奖 #{giveaway_id} 已更新。')
+        if giveaway.get('claim_topic_thread_id'):
+            return
+        topic_name = giveaway.get('claim_topic_name') or f'???? #{giveaway_id}'
+        try:
+            topic = self.api.create_forum_topic(giveaway['claim_group_ref'], topic_name)
+            thread_id = int(topic.get('message_thread_id'))
+            expire_at = giveaway.get('claim_deadline')
+            invite_link = None
+            if expire_at:
+                try:
+                    expire_dt = dt.datetime.fromisoformat(expire_at)
+                    invite = self.api.create_chat_invite_link(
+                        giveaway['claim_group_ref'],
+                        name=f'claim-{giveaway_id}',
+                        expire_date=int(expire_dt.timestamp()),
+                    )
+                    invite_link = invite.get('invite_link')
+                except Exception as exc:
+                    logging.warning('Failed to create claim invite link for giveaway %s: %s', giveaway_id, exc)
+            self.db.update_giveaway(
+                giveaway_id,
+                claim_topic_thread_id=thread_id,
+                claim_topic_invite_link=invite_link,
+                claim_topic_expire_at=expire_at,
+            )
+        except Exception as exc:
+            logging.warning('Failed to create claim topic for giveaway %s: %s', giveaway_id, exc)
+
+    def process_due_claim_topics(self) -> None:
+        current = now_s()
+        for row in self.db.get_due_claim_topics(current):
+            thread_id = row.get('claim_topic_thread_id')
+            if not thread_id or row.get('claim_topic_deleted_at'):
+                continue
+            try:
+                self.api.delete_forum_topic(row['claim_group_ref'], int(thread_id))
+            except Exception as exc:
+                logging.warning('Failed to delete claim topic for giveaway %s: %s', row['id'], exc)
+            self.db.update_giveaway(row['id'], claim_topic_deleted_at=current)
 
     def parse_giveaway_id_arg(self, arg: str) -> int:
-        match = re.match(r'^\s*#?(?P<gid>\d+)\b', arg.strip())
+        match = re.match(r'^\s*#?(?P<gid>\d+)', arg.strip())
         if not match:
-            raise ValueError('请输入抽奖编号，例如 1 或 #1。')
+            raise ValueError('?????????? 1 ? #1?')
         return int(match.group('gid'))
 
     def build_giveaway_status_text(self, status: str) -> str:
         return {
-            'scheduled': '未开始',
-            'live': '进行中',
-            'finalizing': '开奖中',
-            'ended': '已结束',
-            'cancelled': '已取消',
-        }.get(status, '未知状态')
-
-    def get_giveaways_by_filter(self, status_filter: str) -> List[Dict[str, Any]]:
-        if status_filter == 'live':
+            'scheduled': '???',
+            'live': '???',
+            'finalizing': '???',
+    def build_giveaway_list_text(self, giveaways: List[Dict[str, Any]], status_filter: str) -> str:
+        label = {'live': '???', 'ended': '???', 'all': '??'}.get(status_filter, '??')
+        lines = [f'<b>???? - {esc(label)}</b>', '']
+        if not giveaways:
+            lines.append('????????????')
+            return '\n'.join(lines)
             return self.db.all("SELECT * FROM giveaways WHERE status='live' ORDER BY id DESC")
         if status_filter == 'ended':
             return self.db.all("SELECT * FROM giveaways WHERE status IN ('ended', 'cancelled') ORDER BY id DESC")
@@ -1173,31 +1270,37 @@ class GiveawayBot:
         if not token:
             return 'all'
         mapping = {
-            'live': 'live', 'ongoing': 'live', 'active': 'live',
-            'ended': 'ended', 'finished': 'ended', 'done': 'ended',
-            'all': 'all', 'all_giveaways': 'all',
+            'live': 'live',
+            'ongoing': 'live',
+            'active': 'live',
+            'ended': 'ended',
+            'finished': 'ended',
+            'done': 'ended',
+            'all': 'all',
+            'all_giveaways': 'all',
         }
         if token in mapping:
             return mapping[token]
-        raise ValueError('请输入 live、ended 或 all')
+        raise ValueError('??? live?ended ? all')
 
     def build_list_query_buttons(self) -> List[List[Dict[str, Any]]]:
         return [
             [
-                {'text': '进行中', 'callback_data': 'list:live'},
-                {'text': '已结束', 'callback_data': 'list:ended'},
-                {'text': '全部', 'callback_data': 'list:all'},
+                {'text': '???', 'callback_data': 'list:live'},
+                {'text': '???', 'callback_data': 'list:ended'},
+                {'text': '??', 'callback_data': 'list:all'},
             ],
         ]
 
     def build_giveaway_list_text(self, giveaways: List[Dict[str, Any]], status_filter: str) -> str:
-        label = {'live': '进行中', 'ended': '已结束', 'all': '全部'}.get(status_filter, '全部')
-        lines = [f'<b>抽奖列表 - {esc(label)}</b>', '']
+        label = {'live': '???', 'ended': '???', 'all': '??'}.get(status_filter, '??')
+        lines = [f'<b>???? - {esc(label)}</b>', '']
         if not giveaways:
-            lines.append('当前没有符合条件的抽奖。')
-            return '\n'.join(lines)
+            lines.append('????????????')
+            return '
+'.join(lines)
         for giveaway in giveaways[:20]:
-            prize = format_prize_items(jload(giveaway.get('prize_json'), [])) or giveaway.get('prize') or '奖品'
+            prize = format_prize_items(jload(giveaway.get('prize_json'), [])) or giveaway.get('prize') or '??'
             status_text = self.build_giveaway_status_text(giveaway.get('status') or '')
             participant_count = self.db.count_participants(giveaway['id'])
             creator = self.db.get_user_by_id(int(giveaway['created_by']))
@@ -1210,14 +1313,15 @@ class GiveawayBot:
             )
             lines.extend([
                 f'<b>#{giveaway["id"]} {esc(giveaway["title"])} </b>',
-                f'状态：{esc(status_text)}',
-                f'奖品：{esc(prize)}',
-                f'已参与人数：{participant_count}',
-                f'时间：{esc(giveaway["start_time"])} -> {esc(giveaway["end_time"] or "不限")}',
-                f'创建者：{creator_display}',
+                f'???{esc(status_text)}',
+                f'???{esc(prize)}',
+                f'??????{participant_count}',
+                f'???{esc(giveaway["start_time"])} -> {esc(giveaway["end_time"] or "??")}',
+                f'????{creator_display}',
                 '',
             ])
-        return '\n'.join(lines).rstrip()
+        return '
+'.join(lines).rstrip()
 
     def send_giveaway_list(self, chat_id: Any, status_filter: str, message_id: Optional[int] = None) -> None:
         giveaways = self.get_giveaways_by_filter(status_filter)
@@ -1231,27 +1335,27 @@ class GiveawayBot:
                 logging.warning('Failed to edit giveaway list message: %s', exc)
         self.api.send_message(chat_id, text, reply_markup=buttons)
 
-    def list_giveaways(self, message: Dict[str, Any], arg: str = "") -> None:
+    def list_giveaways(self, message: Dict[str, Any], arg: str = '') -> None:
         chat = message['chat']
         if not arg.strip():
-            self.api.send_message(chat['id'], '请选择要查看的抽奖范围。', reply_markup={'inline_keyboard': self.build_list_query_buttons()})
+            self.api.send_message(chat['id'], '????????????', reply_markup={'inline_keyboard': self.build_list_query_buttons()})
             return
         try:
             status_filter = self.normalize_list_filter(arg)
             self.send_giveaway_list(chat['id'], status_filter)
         except Exception as exc:
-            self.api.send_message(chat['id'], f'列表查询失败：{exc}')
+            self.api.send_message(chat['id'], f'???????{exc}')
 
     def handle_list_giveaways_callback(self, callback_query: Dict[str, Any], status_filter: str) -> None:
         message = callback_query.get('message') or {}
         chat = message.get('chat') or {}
-        self.api.answer_callback_query(callback_query['id'], '已切换列表筛选。', show_alert=False)
+        self.api.answer_callback_query(callback_query['id'], '????????', show_alert=False)
         try:
             self.send_giveaway_list(chat['id'], status_filter, message_id=message.get('message_id'))
         except Exception as exc:
             logging.warning('Failed to show giveaway list: %s', exc)
             try:
-                self.api.send_message(chat['id'], f'列表查询失败：{exc}')
+                self.api.send_message(chat['id'], f'???????{exc}')
             except Exception:
                 pass
 
@@ -1260,55 +1364,55 @@ class GiveawayBot:
         chat = message['chat']
         if not arg.strip():
             usage = '/cancel_giveaway <id>' if cancel else '/end_giveaway <id>'
-            self.api.send_message(chat['id'], f'请使用 {usage}，例如 #1 或 1。')
+            self.api.send_message(chat['id'], f'??? {usage}??? #1 ? 1?')
             return
         try:
             giveaway_id = self.parse_giveaway_id_arg(arg)
         except Exception as exc:
-            self.api.send_message(chat['id'], f'编号解析失败：{exc}')
+            self.api.send_message(chat['id'], f'???????{exc}')
             return
         giveaway = self.db.get_giveaway(giveaway_id)
         if not giveaway:
-            self.api.send_message(chat['id'], '未找到该抽奖。')
+            self.api.send_message(chat['id'], '???????')
             return
         if not self.is_admin_of_chat(giveaway['publish_chat_ref'], user['id']):
-            self.api.send_message(chat['id'], '你不是该抽奖对应群组或频道的管理员。')
+            self.api.send_message(chat['id'], '??????????????????')
             return
         if giveaway['status'] in {'ended', 'cancelled'}:
-            self.api.send_message(chat['id'], '该抽奖已经结束或已取消，不能再次操作。')
+            self.api.send_message(chat['id'], '???????????????????')
             return
         if cancel:
             self.db.update_giveaway(giveaway_id, status='cancelled', cancelled_at=now_s(), cancellation_reason='manual_cancel')
             self.db.log('giveaway_cancelled', user['id'], giveaway_id, {'manual': True})
-            self.api.send_message(chat['id'], f'已取消抽奖 #{giveaway_id}。')
+            self.api.send_message(chat['id'], f'????? #{giveaway_id}?')
             return
         if giveaway['status'] != 'live':
             self.db.update_giveaway(giveaway_id, status='live')
         ok = self.finalize_giveaway(giveaway_id, manual=True)
         if ok:
-            self.api.send_message(chat['id'], f'已立即开奖 #{giveaway_id}。')
+            self.api.send_message(chat['id'], f'????? #{giveaway_id}?')
         else:
-            self.api.send_message(chat['id'], '开奖失败，请稍后重试或检查抽奖状态。')
+            self.api.send_message(chat['id'], '??????????????????')
 
     def set_claim_topic_command(self, message: Dict[str, Any], arg: str) -> None:
         user = message['from']
         chat = message['chat']
         if not arg.strip():
-            self.api.send_message(chat['id'], '用法：/set_claim_topic <id> -claim_group @group -claim_topic "领奖话题" -claim_hours 72')
+            self.api.send_message(chat['id'], '???/set_claim_topic <id> -claim_group @group -claim_topic "????" -claim_hours 72')
             return
         try:
             tokens = shlex.split(arg)
             giveaway_id = self.parse_giveaway_id_arg(tokens[0])
-            flags = self.parse_command_flags(" ".join(tokens[1:])) if len(tokens) > 1 else {}
+            flags = self.parse_command_flags(' '.join(tokens[1:])) if len(tokens) > 1 else {}
         except Exception as exc:
-            self.api.send_message(chat['id'], f'参数解析失败：{exc}')
+            self.api.send_message(chat['id'], f'???????{exc}')
             return
         giveaway = self.db.get_giveaway(giveaway_id)
         if not giveaway:
-            self.api.send_message(chat['id'], '未找到该抽奖。')
+            self.api.send_message(chat['id'], '???????')
             return
         if giveaway['status'] in {'ended', 'cancelled'}:
-            self.api.send_message(chat['id'], '该抽奖已经结束或已取消，不能修改领奖配置。')
+            self.api.send_message(chat['id'], '?????????????????????')
             return
         if not flags:
             self.api.send_message(chat['id'], self.giveaway_summary(giveaway_id))
@@ -1321,30 +1425,50 @@ class GiveawayBot:
         if 'claim_topic' in flags:
             updates['claim_topic_name'] = flags['claim_topic'] or None
         if 'claim_hours' in flags or 'claim_topic_hours' in flags:
-            updates['claim_topic_hours'] = parse_optional_int(self.flag_value(flags, 'claim_hours', 'claim_topic_hours'), '领奖话题有效时长', default=72, minimum=1)
+            updates['claim_topic_hours'] = parse_optional_int(self.flag_value(flags, 'claim_hours', 'claim_topic_hours'), '????????', default=72, minimum=1)
         if ('claim_group' in flags or 'claim_topic' in flags or 'claim_hours' in flags or 'claim_topic_hours' in flags) and not claim_group_ref and not giveaway.get('claim_group_ref'):
-            self.api.send_message(chat['id'], '请至少提供 -claim_group，用于创建领奖话题。')
+            self.api.send_message(chat['id'], '????? -claim_group??????????')
             return
         if claim_group_ref and not self.is_admin_of_chat(claim_group_ref, user['id']):
-            self.api.send_message(chat['id'], '你不是领奖群聊的管理员，不能修改这里的配置。')
+            self.api.send_message(chat['id'], '??????????????????????')
             return
         updates['claim_topic_enabled'] = 1 if (updates.get('claim_group_ref') or claim_group_ref or updates.get('claim_topic_name') or giveaway.get('claim_topic_name')) else 0
         self.db.update_giveaway(giveaway_id, **updates)
         self.db.log('claim_topic_updated', user['id'], giveaway_id, updates)
-        self.api.send_message(chat['id'], f'已更新抽奖 #{giveaway_id} 的领奖话题配置。')
+        self.api.send_message(chat['id'], f'????? #{giveaway_id} ????????')
 
     def giveaway_summary(self, giveaway_id: int) -> str:
         giveaway = self.db.get_giveaway(giveaway_id)
         if not giveaway:
-            return '未找到该抽奖。'
+            return '???????'
         return (
-            f'<b>抽奖 #{giveaway_id}</b>\n\n'
-            f'标题：{esc(giveaway["title"])}\n'
-            f'奖品：{esc(giveaway["prize"])}\n'
-            f'中奖人数：{esc(giveaway["winner_count"])}\n'
-            f'开始时间：{esc(giveaway["start_time"])}\n'
-            f'结束时间：{esc(giveaway["end_time"] or "不限")}\n'
-            f'参与人数：{self.db.count_participants(giveaway_id)}\n'
-            f'领奖话题：{esc(giveaway.get("claim_group_ref") or "未设置")} / {esc(giveaway.get("claim_topic_name") or "未设置")}\n'
-            f'参与方式：{esc(method_text(jload(giveaway["entry_methods"], []), giveaway["entry_keyword"], giveaway["required_channel"], int(giveaway["invite_required_count"] or 0), int(giveaway["invite_weight_bonus"] or 0)))}'
+            f'<b>?? #{giveaway_id}</b>
+
+'
+            f'???{esc(giveaway["title"])}
+'
+            f'???{esc(giveaway["prize"])}
+'
+            f'?????{esc(giveaway["winner_count"])}
+'
+    def giveaway_summary(self, giveaway_id: int) -> str:
+        giveaway = self.db.get_giveaway(giveaway_id)
+        if not giveaway:
+            return '???????'
+        return (
+            f'<b>?? #{giveaway_id}</b>\n\n'
+            f'???{esc(giveaway["title"])}\n'
+            f'???{esc(giveaway["prize"])}\n'
+            f'?????{esc(giveaway["winner_count"])}\n'
+            f'?????{esc(giveaway["start_time"])}\n'
+            f'?????{esc(giveaway["end_time"] or "??")}\n'
+            f'?????{self.db.count_participants(giveaway_id)}\n'
+            f'?????{esc(giveaway.get("claim_group_ref") or "???")} / {esc(giveaway.get("claim_topic_name") or "???")}\n'
+            f'?????{esc(method_text(jload(giveaway["entry_methods"], []), giveaway["entry_keyword"], giveaway["required_channel"], int(giveaway["invite_required_count"] or 0), int(giveaway["invite_weight_bonus"] or 0)))}'
         )
+
+"""
+
+from .bot_tail import patch_giveaway_bot
+
+patch_giveaway_bot(GiveawayBot)
