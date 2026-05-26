@@ -1087,4 +1087,3 @@ def patch_giveaway_bot(cls: Any) -> None:
     cls.edit_giveaway_command = edit_giveaway_command
     cls.export_participants = export_participants
     cls.giveaway_summary = giveaway_summary
-
